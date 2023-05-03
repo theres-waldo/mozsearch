@@ -207,48 +207,326 @@ public:
                       const MacroDefinition &Md) override;
 };
 
-// Performs heuristic resolution of entities in template code.
+// This class heuristic resolution of declarations and types in template code.
+//
+// As a compiler, clang only needs to perform certain types of processing on
+// template code (such as resolving dependent names to declarations, or
+// resolving the type of a dependent expression) after instantiation. Indeed,
+// C++ language features such as template specialization mean such resolution
+// cannot be done accurately before instantiation
+//
+// However, template code is written and read in uninstantiated form, and clangd
+// would like to provide editor features like go-to-definition in template code
+// where possible. To this end, clangd attempts to resolve declarations and
+// types in uninstantiated code by using heuristics, understanding that the
+// results may not be fully accurate but that this is better than nothing.
+//
+// At this time, the heuristic used is a simple but effective one: assume that
+// template instantiations are based on the primary template definition and not
+// not a specialization. More advanced heuristics may be added in the future.
 class HeuristicResolver {
 public:
-  // Try to heuristically resolve certain types of expressions to one or more
-  // likely-referenced declarations.
-  static std::vector<const NamedDecl *>
-  resolveMemberExpr(const CXXDependentScopeMemberExpr *ME) {
-    const Type *BaseType = ME->getBaseType().getTypePtrOrNull();
-    return resolveDependentMember(BaseType, ME->getMember());
-  }
+  HeuristicResolver(ASTContext &Ctx) : Ctx(Ctx) {}
+
+  // Try to heuristically resolve certain types of expressions, declarations, or
+  // types to one or more likely-referenced declarations.
+  std::vector<const NamedDecl *>
+  resolveMemberExpr(const CXXDependentScopeMemberExpr *ME) const;
+  std::vector<const NamedDecl *>
+  resolveDeclRefExpr(const DependentScopeDeclRefExpr *RE) const;
+  std::vector<const NamedDecl *>
+  resolveTypeOfCallExpr(const CallExpr *CE) const;
+  std::vector<const NamedDecl *>
+  resolveCalleeOfCallExpr(const CallExpr *CE) const;
+  std::vector<const NamedDecl *>
+  resolveUsingValueDecl(const UnresolvedUsingValueDecl *UUVD) const;
+  std::vector<const NamedDecl *>
+  resolveDependentNameType(const DependentNameType *DNT) const;
+  std::vector<const NamedDecl *> resolveTemplateSpecializationType(
+      const DependentTemplateSpecializationType *DTST) const;
+
+  // Try to heuristically resolve a dependent nested name specifier
+  // to the type it likely denotes. Note that *dependent* name specifiers always
+  // denote types, not namespaces.
+  const Type *
+  resolveNestedNameSpecifierToType(const NestedNameSpecifier *NNS) const;
+
+  // Given the type T of a dependent expression that appears of the LHS of a
+  // "->", heuristically find a corresponding pointee type in whose scope we
+  // could look up the name appearing on the RHS.
+  const Type *getPointeeType(const Type *T) const;
 
 private:
-  // Given a dependent class type and a member name, heuristically resolve the
-  // name to one or more declarations. The current heuristic is simply to look
-  // up the name in the primary template. This is a heuristic because the
-  // template could potentially have specializations that declare different
-  // members. Multiple declarations could be returned if the name is overloaded
+  ASTContext &Ctx;
+
+  // Given a tag-decl type and a member name, heuristically resolve the
+  // name to one or more declarations.
+  // The current heuristic is simply to look up the name in the primary
+  // template. This is a heuristic because the template could potentially
+  // have specializations that declare different members.
+  // Multiple declarations could be returned if the name is overloaded
   // (e.g. an overloaded method in the primary template).
-  static std::vector<const NamedDecl *>
-  resolveDependentMember(const Type *T, DeclarationName Name) {
-    if (!T)
-      return {};
+  // This heuristic will give the desired answer in many cases, e.g.
+  // for a call to vector<T>::size().
+  std::vector<const NamedDecl *> resolveDependentMember(
+      const Type *T, DeclarationName Name,
+      llvm::function_ref<bool(const NamedDecl *ND)> Filter) const;
 
-    const auto *TST = T->getAs<TemplateSpecializationType>();
-    if (!TST) {
-      return {};
+  // Try to heuristically resolve the type of a possibly-dependent expression
+  // `E`.
+  const Type *resolveExprToType(const Expr *E) const;
+  std::vector<const NamedDecl *> resolveExprToDecls(const Expr *E) const;
+};
+
+// Convenience lambdas for use as the 'Filter' parameter of
+// HeuristicResolver::resolveDependentMember().
+const auto NoFilter = [](const NamedDecl *D) { return true; };
+const auto NonStaticFilter = [](const NamedDecl *D) {
+  return D->isCXXInstanceMember();
+};
+const auto StaticFilter = [](const NamedDecl *D) {
+  return !D->isCXXInstanceMember();
+};
+const auto ValueFilter = [](const NamedDecl *D) { return isa<ValueDecl>(D); };
+const auto TypeFilter = [](const NamedDecl *D) { return isa<TypeDecl>(D); };
+const auto TemplateFilter = [](const NamedDecl *D) {
+  return isa<TemplateDecl>(D);
+};
+
+// Helper function for HeuristicResolver::resolveDependentMember()
+// which takes a possibly-dependent type `T` and heuristically
+// resolves it to a CXXRecordDecl in which we can try name lookup.
+CXXRecordDecl *resolveTypeToRecordDecl(const Type *T) {
+  assert(T);
+
+  if (const auto *RT = T->getAs<RecordType>())
+    return dyn_cast<CXXRecordDecl>(RT->getDecl());
+
+  if (const auto *ICNT = T->getAs<InjectedClassNameType>())
+    T = ICNT->getInjectedSpecializationType().getTypePtrOrNull();
+  if (!T)
+    return nullptr;
+
+  const auto *TST = T->getAs<TemplateSpecializationType>();
+  if (!TST)
+    return nullptr;
+
+  const ClassTemplateDecl *TD = dyn_cast_or_null<ClassTemplateDecl>(
+      TST->getTemplateName().getAsTemplateDecl());
+  if (!TD)
+    return nullptr;
+
+  return TD->getTemplatedDecl();
+}
+
+const Type *HeuristicResolver::getPointeeType(const Type *T) const {
+  if (!T)
+    return nullptr;
+
+  if (T->isPointerType())
+    return T->castAs<PointerType>()->getPointeeType().getTypePtrOrNull();
+
+  // Try to handle smart pointer types.
+
+  // Look up operator-> in the primary template. If we find one, it's probably a
+  // smart pointer type.
+  auto ArrowOps = resolveDependentMember(
+      T, Ctx.DeclarationNames.getCXXOperatorName(OO_Arrow), NonStaticFilter);
+  if (ArrowOps.empty())
+    return nullptr;
+
+  // Getting the return type of the found operator-> method decl isn't useful,
+  // because we discarded template arguments to perform lookup in the primary
+  // template scope, so the return type would just have the form U* where U is a
+  // template parameter type.
+  // Instead, just handle the common case where the smart pointer type has the
+  // form of SmartPtr<X, ...>, and assume X is the pointee type.
+  auto *TST = T->getAs<TemplateSpecializationType>();
+  if (!TST)
+    return nullptr;
+  if (TST->template_arguments().size() == 0)
+    return nullptr;
+  const TemplateArgument &FirstArg = TST->template_arguments()[0];
+  if (FirstArg.getKind() != TemplateArgument::Type)
+    return nullptr;
+  return FirstArg.getAsType().getTypePtrOrNull();
+}
+
+std::vector<const NamedDecl *> HeuristicResolver::resolveMemberExpr(
+    const CXXDependentScopeMemberExpr *ME) const {
+  // If the expression has a qualifier, first try resolving the member
+  // inside the qualifier's type.
+  // Note that we cannot use a NonStaticFilter in either case, for a couple
+  // of reasons:
+  //   1. It's valid to access a static member using instance member syntax,
+  //      e.g. `instance.static_member`.
+  //   2. We can sometimes get a CXXDependentScopeMemberExpr for static
+  //      member syntax too, e.g. if `X::static_member` occurs inside
+  //      an instance method, it's represented as a CXXDependentScopeMemberExpr
+  //      with `this` as the base expression as `X` as the qualifier
+  //      (which could be valid if `X` names a base class after instantiation).
+  if (NestedNameSpecifier *NNS = ME->getQualifier()) {
+    if (const Type *QualifierType = resolveNestedNameSpecifierToType(NNS)) {
+      auto Decls =
+          resolveDependentMember(QualifierType, ME->getMember(), NoFilter);
+      if (!Decls.empty())
+        return Decls;
     }
+  }
 
-    const ClassTemplateDecl *TD = dyn_cast_or_null<ClassTemplateDecl>(
-        TST->getTemplateName().getAsTemplateDecl());
-    if (!TD)
-      return {};
+  // If that didn't yield any results, try resolving the member inside
+  // the expression's base type.
+  const Type *BaseType = ME->getBaseType().getTypePtrOrNull();
+  if (ME->isArrow()) {
+    BaseType = getPointeeType(BaseType);
+  }
+  if (!BaseType)
+    return {};
+  if (const auto *BT = BaseType->getAs<BuiltinType>()) {
+    // If BaseType is the type of a dependent expression, it's just
+    // represented as BuiltinType::Dependent which gives us no information. We
+    // can get further by analyzing the dependent expression.
+    Expr *Base = ME->isImplicitAccess() ? nullptr : ME->getBase();
+    if (Base && BT->getKind() == BuiltinType::Dependent) {
+      BaseType = resolveExprToType(Base);
+    }
+  }
+  return resolveDependentMember(BaseType, ME->getMember(), NoFilter);
+}
 
-    CXXRecordDecl *RD = TD->getTemplatedDecl();
+std::vector<const NamedDecl *> HeuristicResolver::resolveDeclRefExpr(
+    const DependentScopeDeclRefExpr *RE) const {
+  return resolveDependentMember(RE->getQualifier()->getAsType(),
+                                RE->getDeclName(), StaticFilter);
+}
+
+std::vector<const NamedDecl *>
+HeuristicResolver::resolveTypeOfCallExpr(const CallExpr *CE) const {
+  const auto *CalleeType = resolveExprToType(CE->getCallee());
+  if (!CalleeType)
+    return {};
+  if (const auto *FnTypePtr = CalleeType->getAs<PointerType>())
+    CalleeType = FnTypePtr->getPointeeType().getTypePtr();
+  if (const FunctionType *FnType = CalleeType->getAs<FunctionType>()) {
+    if (const auto *D =
+            resolveTypeToRecordDecl(FnType->getReturnType().getTypePtr())) {
+      return {D};
+    }
+  }
+  return {};
+}
+
+std::vector<const NamedDecl *>
+HeuristicResolver::resolveCalleeOfCallExpr(const CallExpr *CE) const {
+  if (const auto *ND = dyn_cast_or_null<NamedDecl>(CE->getCalleeDecl())) {
+    return {ND};
+  }
+
+  return resolveExprToDecls(CE->getCallee());
+}
+
+std::vector<const NamedDecl *> HeuristicResolver::resolveUsingValueDecl(
+    const UnresolvedUsingValueDecl *UUVD) const {
+  return resolveDependentMember(UUVD->getQualifier()->getAsType(),
+                                UUVD->getNameInfo().getName(), ValueFilter);
+}
+
+std::vector<const NamedDecl *> HeuristicResolver::resolveDependentNameType(
+    const DependentNameType *DNT) const {
+  return resolveDependentMember(
+      resolveNestedNameSpecifierToType(DNT->getQualifier()),
+      DNT->getIdentifier(), TypeFilter);
+}
+
+std::vector<const NamedDecl *>
+HeuristicResolver::resolveTemplateSpecializationType(
+    const DependentTemplateSpecializationType *DTST) const {
+  return resolveDependentMember(
+      resolveNestedNameSpecifierToType(DTST->getQualifier()),
+      DTST->getIdentifier(), TemplateFilter);
+}
+
+const Type *resolveDeclsToType(const std::vector<const NamedDecl *> &Decls) {
+  if (Decls.size() != 1) // Names an overload set -- just bail.
+    return nullptr;
+  if (const auto *TD = dyn_cast<TypeDecl>(Decls[0])) {
+    return TD->getTypeForDecl();
+  }
+  if (const auto *VD = dyn_cast<ValueDecl>(Decls[0])) {
+    return VD->getType().getTypePtrOrNull();
+  }
+  return nullptr;
+}
+
+std::vector<const NamedDecl *>
+HeuristicResolver::resolveExprToDecls(const Expr *E) const {
+  if (const auto *ME = dyn_cast<CXXDependentScopeMemberExpr>(E)) {
+    return resolveMemberExpr(ME);
+  }
+  if (const auto *RE = dyn_cast<DependentScopeDeclRefExpr>(E)) {
+    return resolveDeclRefExpr(RE);
+  }
+  if (const auto *OE = dyn_cast<OverloadExpr>(E)) {
+    return {OE->decls_begin(), OE->decls_end()};
+  }
+  if (const auto *CE = dyn_cast<CallExpr>(E)) {
+    return resolveTypeOfCallExpr(CE);
+  }
+  if (const auto *ME = dyn_cast<MemberExpr>(E))
+    return {ME->getMemberDecl()};
+
+  return {};
+}
+
+const Type *HeuristicResolver::resolveExprToType(const Expr *E) const {
+  std::vector<const NamedDecl *> Decls = resolveExprToDecls(E);
+  if (!Decls.empty())
+    return resolveDeclsToType(Decls);
+
+  return E->getType().getTypePtr();
+}
+
+const Type *HeuristicResolver::resolveNestedNameSpecifierToType(
+    const NestedNameSpecifier *NNS) const {
+  if (!NNS)
+    return nullptr;
+
+  // The purpose of this function is to handle the dependent (Kind ==
+  // Identifier) case, but we need to recurse on the prefix because
+  // that may be dependent as well, so for convenience handle
+  // the TypeSpec cases too.
+  switch (NNS->getKind()) {
+  case NestedNameSpecifier::TypeSpec:
+  case NestedNameSpecifier::TypeSpecWithTemplate:
+    return NNS->getAsType();
+  case NestedNameSpecifier::Identifier: {
+    return resolveDeclsToType(resolveDependentMember(
+        resolveNestedNameSpecifierToType(NNS->getPrefix()),
+        NNS->getAsIdentifier(), TypeFilter));
+  }
+  default:
+    break;
+  }
+  return nullptr;
+}
+
+std::vector<const NamedDecl *> HeuristicResolver::resolveDependentMember(
+    const Type *T, DeclarationName Name,
+    llvm::function_ref<bool(const NamedDecl *ND)> Filter) const {
+  if (!T)
+    return {};
+  if (auto *ET = T->getAs<EnumType>()) {
+    auto Result = ET->getDecl()->lookup(Name);
+    return {Result.begin(), Result.end()};
+  }
+  if (auto *RD = resolveTypeToRecordDecl(T)) {
     if (!RD->hasDefinition())
       return {};
-
     RD = RD->getDefinition();
-    return RD->lookupDependentName(Name,
-                                   [](const NamedDecl *) { return true; });
+    return RD->lookupDependentName(Name, Filter);
   }
-};
+  return {};
+}
 
 class IndexConsumer : public ASTConsumer,
                       public RecursiveASTVisitor<IndexConsumer>,
@@ -260,6 +538,7 @@ private:
   std::map<FileID, std::unique_ptr<FileInfo>> FileMap;
   MangleContext *CurMangleContext;
   ASTContext *AstContext;
+  std::unique_ptr<HeuristicResolver> Resolver;
 
   typedef RecursiveASTVisitor<IndexConsumer> Super;
 
@@ -642,6 +921,7 @@ public:
       clang::ItaniumMangleContext::create(Ctx, CI.getDiagnostics());
 
     AstContext = &Ctx;
+    Resolver = std::make_unique<HeuristicResolver>(Ctx);
     TraverseDecl(Ctx.getTranslationUnitDecl());
 
     // Emit the JSON data for all files now.
@@ -2053,7 +2333,7 @@ public:
     }
 
     // If possible, provide a heuristic result without instantiation.
-    for (const NamedDecl *D : HeuristicResolver::resolveMemberExpr(E)) {
+    for (const NamedDecl *D : Resolver->resolveMemberExpr(E)) {
       if (const FunctionDecl *F = dyn_cast<FunctionDecl>(D)) {
         std::string Mangled = getMangledName(CurMangleContext, F);
         visitIdentifier("use", "function", getQualifiedName(F), Loc, Mangled,
