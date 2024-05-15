@@ -10,6 +10,7 @@ use crate::blame;
 use crate::file_format::analysis_manglings::make_file_sym_from_path;
 use crate::file_format::crossref_converter::{
     determine_desired_extra_syms_from_jumpref, extra_syms_next_step_lookups, JumprefTraversals,
+    semantic_token_kind_from_jumpref
 };
 use crate::file_format::crossref_lookup::CrossrefLookupMap;
 use crate::git_ops;
@@ -38,6 +39,45 @@ pub struct FormattedLine {
     pub sym_starts_nest: Option<Ustr>,
     // This line should close this many <div>'s.
     pub pop_nest_count: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SemanticTokenKind {
+  Variable,
+  LocalVariable,
+  Parameter,
+  Function,
+  Method,
+  Field,
+  Class,
+  Enum,
+  EnumConstant,
+  Typedef,
+  Type,
+  Unknown,
+  Namespace,
+  TemplateParameter,
+  Concept,
+  Primitive,
+  Macro,
+  OverloadedOperator,
+  Label
+}
+
+pub fn str_from_semantic_kind(kind: SemanticTokenKind) -> String {
+  (match kind {
+    SemanticTokenKind::Enum => "enum",
+    SemanticTokenKind::EnumConstant => "enum_constant",
+    SemanticTokenKind::Class => "class",
+    SemanticTokenKind::Method => "method",
+    SemanticTokenKind::Function => "function",
+    SemanticTokenKind::Field => "field",
+    SemanticTokenKind::Parameter => "parameter",
+    SemanticTokenKind::LocalVariable => "localVar",
+    SemanticTokenKind::Variable => "variable",
+    SemanticTokenKind::Namespace => "namespace",
+    _ => "<unsupported>"
+  }).to_string()
 }
 
 /// Renders source code into a Vec of HTML-formatted lines wrapped in `FormattedLine` objects that
@@ -98,6 +138,7 @@ pub fn format_code(
     // token.
     let mut generated_sym_info = BTreeMap::new();
     let mut jumpref_traversed: UstrMap<JumprefTraversals> = UstrMap::default();
+    let mut semantic_kind_cache: UstrMap<Option<SemanticTokenKind>> = UstrMap::default();
 
     // Stuff the file's own info in the symbol info map.
     if let Some(lookup) = jumpref_lookup {
@@ -178,6 +219,7 @@ pub fn format_code(
             None
         };
 
+        let mut semantic_kind = None;
         match (&token.kind, datum) {
             (&tokenize::TokenKind::Identifier(_), Some(d))
             | (&tokenize::TokenKind::StringLiteral, Some(d)) => {
@@ -231,8 +273,15 @@ pub fn format_code(
                                 }
                                 generated_sym_info.insert(*sym, json!(obj));
                             }
+                            if let Some(lookup) = jumpref_lookup {
+                              if let Ok(jumpref) = lookup.lookup(&sym) {
+                                semantic_kind_cache.insert(sym.clone(), semantic_token_kind_from_jumpref(&jumpref));
+                              }
+                            }
                         } else if let Some(lookup) = jumpref_lookup {
                             if let Ok(jumpref) = lookup.lookup(sym) {
+                                semantic_kind_cache.insert(sym.clone(), semantic_token_kind_from_jumpref(&jumpref));
+
                                 // See if there are any binding slot symbols that we should also
                                 // include.  This allows us to do things like, when presenting a
                                 // context menu for a synthetic XPIDL symbol, we can also provide an
@@ -291,6 +340,19 @@ pub fn format_code(
                             }
                         }
                     }
+                    // Slight hack: if there are multiple source records for this token,
+                    // choose the semantic token from the first symbol for which we have one.
+                    // This should be refined using some notion of priority between symbols,
+                    // with e.g. an explicitly referenced symbol taking priority over an
+                    // implicitly referenced symbol. (Example: in `MyClass var;`, the `var`
+                    // token is associated with both the variable's symbol and the constructor's
+                    // symbol; the latter is an implicit reference.)
+                    for sym in &a.sym {
+                      if let Some(kind) = semantic_kind_cache.get(sym).unwrap_or(&None) {
+                        semantic_kind = Some(*kind);
+                        break;
+                      }
+                    }
                 }
             }
             _ => {}
@@ -340,12 +402,15 @@ pub fn format_code(
                     let classes = datum.flat_map(|a| {
                         has_datum = true;
                         a.syntax.iter().flat_map(|s| match s.as_ref() {
-                            "type" => vec!["syn_type"],
-                            "def" | "decl" | "idl" => vec!["syn_def"],
+                            "type" => vec!["syn_type".to_string()],
+                            "def" | "decl" | "idl" => vec!["syn_def".to_string()],
                             _ => vec![],
                         })
                     });
-                    let classes = classes.collect::<Vec<_>>();
+                    let mut classes = classes.collect::<Vec<_>>();
+                    if let Some(semantic_kind) = semantic_kind {
+                      classes.push(format!("syn_{}", str_from_semantic_kind(semantic_kind)));
+                    }
                     if !classes.is_empty() {
                         format!("class=\"{}\" ", classes.join(" "))
                     } else if has_datum {
